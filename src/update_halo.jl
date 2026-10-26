@@ -29,6 +29,7 @@ Update the halo of the given GPU/CPU-array(s). If multiple global grids have bee
 """
 function update_halo!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellFieldConvertible, GGField}...; dims=(NDIMS_MPI,(1:NDIMS_MPI-1)...), active_global_grid=global_grid())
     check_initialized()
+    TRACE[] && trace_begin!()
     # If no global grid is active we swap the null grid with the argument passed one, if that one is null as well a error will be thrown
     old = grid_is_initialized() ? global_grid() : GLOBAL_GRID_NULL
     activate_global_grid(active_global_grid)
@@ -36,55 +37,69 @@ function update_halo!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellF
     As = ((extract.(A)...)...,);
     fields = wrap_field.(As);
     check_fields(fields...);
+    TRACE[] && trace_setup!(TQ_CHECKS)
     _update_halo!(fields...; dims=dims);  # Assignment of A to fields in the internal function _update_halo!() as vararg A can consist of multiple fields; A will be used for a single field in the following (The args of update_halo! must however be "A..." for maximal simplicity and elegance for the user).
     activate_global_grid(old)
+    TRACE[] && trace_end!(fields...)
     return nothing
 end
 
 function _update_halo!(fields::GGField...; dims=dims)
+    tr = TRACE[]
     if (!cuda_enabled() && !amdgpu_enabled() && !all_arrays(fields...)) error("not all arrays are CPU arrays, but no GPU extension is loaded.") end #NOTE: in the following, it is only required to check for `cuda_enabled()`/`amdgpu_enabled()` when the context does not imply `any_cuarray(fields...)` or `is_cuarray(A)` or the corresponding for AMDGPU. # NOTE: the case where only one of the two extensions are loaded, but an array dad would be for the other extension is passed is very unlikely and therefore not explicitly checked here (but could be added later).
     allocate_bufs(fields...);
     if any_array(fields...) allocate_tasks(fields...); end
     if any_cuarray(fields...) allocate_custreams(fields...); end
     if any_rocarray(fields...) allocate_rocstreams(fields...); end
+    tr && trace_setup!(TQ_BUFFERS)
 
     for dim in dims  # NOTE: this works for 1D-3D (e.g. if nx>1, ny>1 and nz=1, then for d=3, there will be no neighbors, i.e. nothing will be done as desired...).
+        t = tr ? time_ns() : UInt64(0)
         for ns = 1:NNEIGHBORS_PER_DIM,  i = 1:length(fields)
             if has_neighbor(ns, dim) iwrite_sendbufs!(ns, dim, fields[i], i); end
         end
+        tr && (t = trace_lap!(TQ_PACK, dim, t))
         # Send / receive if the neighbors are other processes (usual case).
         reqs = fill(MPI.REQUEST_NULL, length(fields), NNEIGHBORS_PER_DIM, 2);
         if all(neighbors(dim) .!= me())  # Note: handling of send/recv to itself requires special configurations for some MPI implementations (e.g. self BTL must be activated with OpenMPI); so we handle this case without MPI to avoid this complication.
             for nr = NNEIGHBORS_PER_DIM:-1:1,  i = 1:length(fields) # Note: if there were indeed more than 2 neighbors per dimension; then one would need to make sure which neigbour would communicate with which.
                 if has_neighbor(nr, dim) reqs[i,nr,1] = irecv_halo!(nr, dim, fields[i], i); end
             end
+            tr && (t = trace_lap!(TQ_IRECV, dim, t))
             for ns = 1:NNEIGHBORS_PER_DIM,  i = 1:length(fields)
                 if has_neighbor(ns, dim)
                     wait_iwrite(ns, fields[i], i);  # Right before starting to send, make sure that the data of neighbor ns and field i has finished writing to the sendbuffer.
+                    tr && (t = trace_lap!(TQ_WAIT_PACK, dim, t))
                     reqs[i,ns,2] = isend_halo(ns, dim, fields[i], i);
+                    tr && (t = trace_lap!(TQ_ISEND, dim, t); trace_stamp!(TQ_T_FIRST_ISEND, dim; first=true))
                 end
             end
         # Copy if I am my own neighbors (when periodic boundary and only one process in this dimension).
         elseif all(neighbors(dim) .== me())
             for ns = 1:NNEIGHBORS_PER_DIM,  i = 1:length(fields)
                 wait_iwrite(ns, fields[i], i);  # Right before starting to send, make sure that the data of neighbor ns and field i has finished writing to the sendbuffer.
+                tr && (t = trace_lap!(TQ_WAIT_PACK, dim, t))
                 sendrecv_halo_local(ns, dim, fields[i], i);
+                tr && (t = trace_lap!(TQ_ISEND, dim, t))
                 nr = NNEIGHBORS_PER_DIM - ns + 1;
                 iread_recvbufs!(nr, dim, fields[i], i);
+                tr && (t = trace_lap!(TQ_UNPACK, dim, t))
             end
         else
             error("Incoherent neighbors in dimension $dim: either all neighbors must equal to me, or none.")
         end
         for nr = NNEIGHBORS_PER_DIM:-1:1,  i = 1:length(fields)  # Note: if there were indeed more than 2 neighbors per dimension; then one would need to make sure which neigbour would communicate with which.
-            if (reqs[i,nr,1]!=MPI.REQUEST_NULL) MPI.Wait(reqs[i,nr,1]); end
-            if (has_neighbor(nr, dim) && neighbor(nr, dim)!=me()) iread_recvbufs!(nr, dim, fields[i], i); end  # Note: if neighbor(nr,dim) != me() is done directly in the sendrecv_halo_local loop above for better performance (thanks to pipelining)
+            if (reqs[i,nr,1]!=MPI.REQUEST_NULL) MPI.Wait(reqs[i,nr,1]); tr && (t = trace_lap!(TQ_WAIT_RECV, dim, t); trace_stamp!(TQ_T_RECV_DONE, dim)); end
+            if (has_neighbor(nr, dim) && neighbor(nr, dim)!=me()) iread_recvbufs!(nr, dim, fields[i], i); tr && (t = trace_lap!(TQ_UNPACK, dim, t)); end  # Note: if neighbor(nr,dim) != me() is done directly in the sendrecv_halo_local loop above for better performance (thanks to pipelining)
         end
         for nr = NNEIGHBORS_PER_DIM:-1:1,  i = 1:length(fields) # Note: if there were indeed more than 2 neighbors per dimension; then one would need to make sure which neigbour would communicate with which.
             if has_neighbor(nr, dim) wait_iread(nr, fields[i], i); end
         end
+        tr && (t = trace_lap!(TQ_WAIT_UNPACK, dim, t))
         for ns = 1:NNEIGHBORS_PER_DIM
             if (any(reqs[:,ns,2].!=[MPI.REQUEST_NULL])) MPI.Waitall(reqs[:,ns,2]); end
         end
+        tr && trace_lap!(TQ_WAITALL_SEND, dim, t)
     end
 end
 

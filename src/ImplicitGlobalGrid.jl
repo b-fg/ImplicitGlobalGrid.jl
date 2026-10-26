@@ -58,6 +58,7 @@ include("gather.jl")
 include("init_global_grid.jl")
 include("select_device.jl")
 include("tools.jl")
+include("trace.jl")
 include("update_halo.jl")
 
 end
