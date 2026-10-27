@@ -26,6 +26,9 @@ Update the halo of the given GPU/CPU-array(s). If multiple global grids have bee
     ```shell
     shell> export IGG_ROCMAWARE_MPI=1
     ```
+
+!!! note "Performance note"
+    For CUDA arrays, `IGG_FUSED=1` (one round of messages per dimension, the same messages) or `IGG_FUSED=2` (one round for all dimensions, edges and corners from the diagonal neighbours), set before `init_global_grid`, pack each round with one kernel, wait once, send one message per neighbour and unpack with one kernel, with the same result. `update_halo!` then returns before the halos are unpacked, on the task's stream: synchronize it before reading the arrays from the host or another stream. See `src/fused_halo.jl`.
 """
 function update_halo!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellFieldConvertible, GGField}...; dims=(NDIMS_MPI,(1:NDIMS_MPI-1)...), active_global_grid=global_grid())
     check_initialized()
@@ -34,13 +37,18 @@ function update_halo!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellF
     old = grid_is_initialized() ? global_grid() : GLOBAL_GRID_NULL
     activate_global_grid(active_global_grid)
     if !grid_is_initialized() error("No grid is active when calling update_halo!, activate a grid first or pass it as an argument.") end
+    if FUSED[] > 0 && fused_halo!(A, dims)  # IGG_FUSED: see fused_halo.jl
+        activate_global_grid(old)
+        TRACE[] && trace_end!(size(A[1]), length(A), FUSED[])
+        return nothing
+    end
     As = ((extract.(A)...)...,);
     fields = wrap_field.(As);
     check_fields(fields...);
     TRACE[] && trace_setup!(TQ_CHECKS)
     _update_halo!(fields...; dims=dims);  # Assignment of A to fields in the internal function _update_halo!() as vararg A can consist of multiple fields; A will be used for a single field in the following (The args of update_halo! must however be "A..." for maximal simplicity and elegance for the user).
     activate_global_grid(old)
-    TRACE[] && trace_end!(fields...)
+    TRACE[] && trace_end!(size(fields[1].A), length(fields), 0)
     return nothing
 end
 
