@@ -1,5 +1,6 @@
-# The fused halo updates (IGG_FUSED=1 and 2, see src/fused_halo.jl) give the same arrays as update_halo!, bit for bit,
-# over many process layouts, periodicities, overlaps, halowidths, dimension subsets and fields of different sizes.
+# The fused halo updates (IGG_FUSED=1 and 2, see src/fused_halo.jl), also split by update_halo_start! and
+# update_halo_finish!, give the same arrays as update_halo!, bit for bit, over many process layouts, periodicities,
+# overlaps, halowidths, dimension subsets and fields of different sizes.
 # NOTE: run with several processes (e.g. 2, 4 and 8): with one, every periodic neighbour is the process itself and
 # the fused update leaves it to update_halo!.
 
@@ -30,18 +31,19 @@ function check(nxyz, layout, period, overlaps, halowidths)
     for sizes in ([nxyz_l], fill(nxyz_l, 3), [nxyz_l, nxyz_l .+ (1, 0, 0), nxyz_l .- (overlaps[1] - 1, 0, 0)])
         for dims in unique([(1, 2, 3), (3, 1, 2), splitdims, (1, 3)])
             A0 = [CUDA.rand(Float32, s...) for s in sizes]
-            res = map(0:2) do mode
+            # update_halo! with each mode, then update_halo_start! and update_halo_finish! with each mode
+            res = map(Iterators.product(0:2, (false, true))) do (mode, halves)
                 GG.FUSED[] = mode
                 A = copy.(A0)
                 CUDA.synchronize()  # update_halo! packs on its own streams, which do not wait for the copies
                 for _ in 1:2  # twice: the second call runs the cached plan
-                    update_halo!(A...; dims=dims)
+                    halves ? update_halo_finish!(update_halo_start!(A...; dims=dims)) : update_halo!(A...; dims=dims)
                 end
                 CUDA.synchronize()
                 Array.(A)
             end
             GG.FUSED[] = 0
-            ok &= res[1] == res[2] == res[3]
+            ok &= all(==(res[1]), res)
         end
     end
     finalize_global_grid(finalize_MPI=false)

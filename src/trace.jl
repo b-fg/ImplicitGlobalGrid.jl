@@ -2,8 +2,8 @@ export halo_trace, halo_trace_reset!
 
 # Opt-in timers for update_halo! (environment variable IGG_TRACE=1, read by init_global_grid). Each rank adds up the
 # host time of every phase of every call, per dimension (per round of messages with IGG_FUSED) and per call signature
-# (size of the first array, number of fields, IGG_FUSED); halo_trace() gathers them on one rank and prints them,
-# halo_trace_reset!() clears them (e.g. after warmup).
+# (size of the first array, number of fields, IGG_FUSED, split by update_halo_start!); halo_trace() gathers them on
+# one rank and prints them, halo_trace_reset!() clears them (e.g. after warmup).
 # Off by default; the cost when off is one branch per phase.
 
 const TRACE = Ref(false)
@@ -29,7 +29,7 @@ end
 HaloTrace() = HaloTrace(0, zeros(length(TRACE_DIM_ROWS), 3), zeros(length(TRACE_CALL_ROWS)))
 
 const TRACE_CUR = HaloTrace()                     # the current call
-const TRACE_STATS = Dict{Any,HaloTrace}()         # (size of the first array, number of fields) => sums
+const TRACE_STATS = Dict{Any,HaloTrace}()         # (size of the first array, number of fields, IGG_FUSED, started) => sums
 
 init_trace() = (TRACE[] = parse(Int, get(ENV, "IGG_TRACE", "0")) > 0; nothing)
 
@@ -63,14 +63,14 @@ function trace_setup!(q::Integer)
     return nothing
 end
 
-function trace_end!(sz::Tuple, nfields::Integer, fused::Integer)
+function trace_end!(sz::Tuple, nfields::Integer, fused::Integer; started::Bool=false)
     t1 = time_ns()
     b, g = _gc_state()
     c = TRACE_CUR.call
     c[TQ_TOTAL] = (t1 - TRACE_T0[]) * 1e-9
     c[TQ_ALLOC] = b - TRACE_GC0[][1]
     c[TQ_GC]    = (g - TRACE_GC0[][2]) * 1e-9
-    s = get!(HaloTrace, TRACE_STATS, (sz, nfields, fused))
+    s = get!(HaloTrace, TRACE_STATS, (sz, nfields, fused, started))
     s.ncalls += 1; s.dim .+= TRACE_CUR.dim; s.call .+= c
     return nothing
 end
@@ -86,12 +86,14 @@ halo_trace_reset!() = (empty!(TRACE_STATS); nothing)
     halo_trace(; io=stdout, root=0, per=1, unit="run", byrank=false)
 
 Gather the `update_halo!` timers of all ranks (collective) and print them on rank `root`: per call signature (size of
-the first array, number of fields, `IGG_FUSED` if the fused update ran), the mean time per call of each phase and
-dimension (round of messages) [µs], as the median and the range over the ranks, or (`byrank=true`) for each rank.
+the first array, number of fields, `IGG_FUSED` if the fused update ran, split by `update_halo_start!` and
+`update_halo_finish!`), the mean time per call of each phase and dimension (round of messages) [µs], as the median
+and the range over the ranks, or (`byrank=true`) for each rank.
 The medians of the phases come from different ranks and do not add up: ranks wait (`wait_recv`) in different
 dimensions, for neighbours that are late. `t_first_isend` and `t_recv_done` are instants since the call entry; a rank
-waits for its neighbours' `t_first_isend`. The totals are divided by `per` (e.g. the number of time steps, with
-`unit="step"`). Recorded only with `IGG_TRACE=1` set before `init_global_grid`.
+waits for its neighbours' `t_first_isend`. A split update counts from its start to its finish, the host work in
+between included, and its `wait_recv` is what the finish still waited. The totals are divided by `per` (e.g. the
+number of time steps, with `unit="step"`). Recorded only with `IGG_TRACE=1` set before `init_global_grid`.
 """
 function halo_trace(; io::IO=stdout, root::Integer=0, per::Integer=1, unit::AbstractString="run", byrank::Bool=false)
     check_initialized()
@@ -114,7 +116,7 @@ function halo_trace(; io::IO=stdout, root::Integer=0, per::Integer=1, unit::Abst
     println(io, "all calls: $(cell((grand[1], grand[cld(end, 2)], grand[end]); scale=1e3)) ms per $unit")
     for k in sigs
         dims_used = [d for d in 1:3 if any(s -> haskey(s, k) && any(>(0), view(s[k].dim, :, d)), all_stats)]
-        println(io, "\n$(join(k[1], "x")), $(k[2]) field(s)$(k[3] > 0 ? ", IGG_FUSED=$(k[3])" : ""): $(cell(over_ranks(st -> st.ncalls, k; per_call=false); scale=1)) " *
+        println(io, "\n$(join(k[1], "x")), $(k[2]) field(s)$(k[3] > 0 ? ", IGG_FUSED=$(k[3])" : "")$(k[4] ? ", update_halo_start!/finish!" : ""): $(cell(over_ranks(st -> st.ncalls, k; per_call=false); scale=1)) " *
                     "calls, $(cell(over_ranks(st -> st.call[TQ_TOTAL] / per, k; per_call=false); scale=1e3)) ms per $unit")
         println(io, "  per call: total $(cell(over_ranks(st -> st.call[TQ_TOTAL], k))), " *
                     "checks $(cell(over_ranks(st -> st.call[TQ_CHECKS], k))), buffers $(cell(over_ranks(st -> st.call[TQ_BUFFERS], k))), " *

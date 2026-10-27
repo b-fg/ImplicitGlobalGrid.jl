@@ -13,10 +13,14 @@
 #
 # update_halo! then returns before the halos are unpacked: use the arrays on the task's stream (as CUDA.jl does by
 # default), or synchronize it, before reading them from the host or from another stream.
+#
+# update_halo_start! and update_halo_finish! split a fused update after the messages of its last round are posted,
+# so that work that does not read the halos runs while they travel.
 
 const FUSED = Ref(0)
 const HALO_PLANS = Dict{Any,Any}()  # call signature => plan of the GPU extension (nothing: not supported, use update_halo!)
 const FUSED_TAG = 2^14               # message tags: FUSED_TAG + round
+const HALO_STARTED = Ref(false)      # an update_halo_start! waits for its update_halo_finish!
 
 function init_fused()
     FUSED[] = parse(Int, get(ENV, "IGG_FUSED", "0"))
@@ -24,10 +28,19 @@ function init_fused()
     return nothing
 end
 
-# Handled by a GPU extension for its arrays: return true if it updated the halos of A.
+# Handled by a GPU extension for its arrays: return true if it updated the halos of A; for the start, the HaloUpdate
+# to finish, or nothing if update_halo! has to do it.
 fused_halo!(A::Tuple, dims) = false
+fused_halo_start!(A::Tuple, dims) = nothing
+function fused_halo_finish! end
 free_plan!(plan) = nothing
-free_halo_plans!() = (foreach(free_plan!, values(HALO_PLANS)); empty!(HALO_PLANS); nothing)
+free_halo_plans!() = (foreach(free_plan!, values(HALO_PLANS)); empty!(HALO_PLANS); HALO_STARTED[] = false; nothing)
+
+# A fused update started by update_halo_start!: the plan of the GPU extension and the arrays
+struct HaloUpdate{P,T<:Tuple}
+    plan::P
+    A::T
+end
 
 # A box of one field, copied to or from a flat buffer (also read by the kernels: isbits)
 struct HaloRegion

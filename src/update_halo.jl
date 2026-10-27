@@ -1,4 +1,4 @@
-export update_halo!
+export update_halo!, update_halo_start!, update_halo_finish!
 
 """
     update_halo!(A)
@@ -49,6 +49,37 @@ function update_halo!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellF
     _update_halo!(fields...; dims=dims);  # Assignment of A to fields in the internal function _update_halo!() as vararg A can consist of multiple fields; A will be used for a single field in the following (The args of update_halo! must however be "A..." for maximal simplicity and elegance for the user).
     activate_global_grid(old)
     TRACE[] && trace_end!(size(fields[1].A), length(fields), 0)
+    return nothing
+end
+
+"""
+    h = update_halo_start!(A...; dims, active_global_grid)
+    update_halo_finish!(h)
+
+`update_halo!(A...; dims, active_global_grid)` in two halves, so that work that does not read the halos can run while the messages travel: `update_halo_start!` packs the halos and posts the messages, `update_halo_finish!` waits for them and unpacks the halos. The values sent are those of the arrays at `update_halo_start!`. In between, do not read or write the halos, and do not update halos (`update_halo!` or `update_halo_start!`).
+
+Only the fused updates of CUDA arrays (`IGG_FUSED=1` or `2`, see `src/fused_halo.jl`) return with messages in flight: those of the last dimension with `IGG_FUSED=1`, all of them with `IGG_FUSED=2`. Otherwise `update_halo_start!` updates the halos itself and returns `nothing`, for which `update_halo_finish!` does nothing.
+"""
+function update_halo_start!(A::Union{GGArray, GGFieldConvertible, GGCellArray, GGCellFieldConvertible, GGField}...; dims=(NDIMS_MPI,(1:NDIMS_MPI-1)...), active_global_grid=global_grid())
+    HALO_STARTED[] && error("update_halo_start!: the update started before was not finished (update_halo_finish!)")
+    if FUSED[] > 0
+        check_initialized()
+        TRACE[] && trace_begin!()
+        old = grid_is_initialized() ? global_grid() : GLOBAL_GRID_NULL
+        activate_global_grid(active_global_grid)
+        h = fused_halo_start!(A, dims)
+        activate_global_grid(old)
+        h === nothing || (HALO_STARTED[] = true; return h)
+    end
+    update_halo!(A...; dims=dims, active_global_grid=active_global_grid)
+    return nothing
+end
+
+update_halo_finish!(::Nothing) = nothing
+function update_halo_finish!(h::HaloUpdate)
+    fused_halo_finish!(h)
+    HALO_STARTED[] = false
+    TRACE[] && trace_end!(size(h.A[1]), length(h.A), FUSED[]; started=true)
     return nothing
 end
 

@@ -1,4 +1,4 @@
-import ImplicitGlobalGrid: HaloRegion, HaloRound, HALO_PLANS, FUSED, FUSED_TAG, halo_rounds, halo_plan_key, global_grid,
+import ImplicitGlobalGrid: HaloRegion, HaloRound, HaloUpdate, HALO_PLANS, FUSED, FUSED_TAG, halo_rounds, halo_plan_key, global_grid,
                            TRACE, trace_setup!, trace_lap!, trace_stamp!, TQ_CHECKS, TQ_BUFFERS, TQ_PACK, TQ_WAIT_PACK,
                            TQ_IRECV, TQ_ISEND, TQ_WAIT_RECV, TQ_UNPACK, TQ_WAITALL_SEND, TQ_T_FIRST_ISEND, TQ_T_RECV_DONE
 import MPI
@@ -98,13 +98,13 @@ end
 unfused() = (CUDA.synchronize(CUDA.stream(); blocking=true); false)
 ImplicitGlobalGrid.fused_halo!(A::Tuple{Vararg{AnyCuArray}}, dims) = unfused()  # not 3-D, or of different types
 
-function ImplicitGlobalGrid.fused_halo!(A::Tuple{Vararg{CuArray{T,3}}}, dims) where {T}
-    tr = TRACE[]
+# The cached plan of the fused update of A along dims, or nothing if update_halo! has to do it
+function cached_plan(A::Tuple{Vararg{CuArray{T,3}}}, dims) where {T}
     for i in eachindex(A), j in i+1:length(A)
-        A[i] === A[j] && return unfused()  # update_halo! reports the duplicate
+        A[i] === A[j] && return nothing  # update_halo! reports the duplicate
     end
     # mixed CUDA-aware and staged dimensions
-    any(ImplicitGlobalGrid.cudaaware_MPI()) && !all(ImplicitGlobalGrid.cudaaware_MPI()) && return unfused()
+    any(ImplicitGlobalGrid.cudaaware_MPI()) && !all(ImplicitGlobalGrid.cudaaware_MPI()) && return nothing
     key = halo_plan_key(A, dims)
     plan = get(HALO_PLANS, key, missing)
     if plan === missing
@@ -113,42 +113,74 @@ function ImplicitGlobalGrid.fused_halo!(A::Tuple{Vararg{CuArray{T,3}}}, dims) wh
         rounds = halo_rounds(A, dims, FUSED[])
         plan = HALO_PLANS[key] = rounds === nothing ? nothing : CuHaloPlan(A, rounds)
     end
+    TRACE[] && (trace_setup!(TQ_CHECKS); trace_setup!(TQ_BUFFERS))
+    return plan
+end
+
+function ImplicitGlobalGrid.fused_halo!(A::Tuple{Vararg{CuArray{T,3}}}, dims) where {T}
+    plan = cached_plan(A, dims)
     plan === nothing && return unfused()
-    tr && (trace_setup!(TQ_CHECKS); trace_setup!(TQ_BUFFERS))
-    run_halo_plan!(plan, A, tr)
+    start_halo_plan!(plan, A, TRACE[])
+    finish_halo_plan!(plan, A, TRACE[])
     return true
 end
 
-function run_halo_plan!(plan::CuHaloPlan, A, tr::Bool)
-    s = CUDA.stream()
-    comm = plan.comm
-    t = tr ? time_ns() : UInt64(0)
-    for (k, r) in enumerate(plan.rounds)
-        tag = FUSED_TAG + k
-        if r.blocks_send > 0
-            plan.pack(r.sendbuf, A, r.sendregs, Val(true); threads=HALO_THREADS, blocks=(r.blocks_send, length(r.round.send)), stream=s)
-        end
-        tr && (t = trace_lap!(TQ_PACK, k, t))
-        CUDA.synchronize(s; blocking=true)  # also orders this round's receives after the last unpack from its buffer
-        tr && (t = trace_lap!(TQ_WAIT_PACK, k, t))
-        for (m, msg) in enumerate(r.round.recvmsgs)
-            MPI.Irecv!(r.recvmpi[m], msg.peer, tag, comm, r.recvreqs[m])
-        end
-        tr && (t = trace_lap!(TQ_IRECV, k, t))
-        for (m, msg) in enumerate(r.round.sendmsgs)
-            MPI.Isend(r.sendmpi[m], msg.peer, tag, comm, r.sendreqs[m])
-        end
-        tr && (t = trace_lap!(TQ_ISEND, k, t); trace_stamp!(TQ_T_FIRST_ISEND, k))
-        MPI.Waitall(r.recvreqs)
-        tr && (t = trace_lap!(TQ_WAIT_RECV, k, t); trace_stamp!(TQ_T_RECV_DONE, k))
-        if r.blocks_recv > 0
-            plan.unpack(r.recvbuf, A, r.recvregs, Val(false); threads=HALO_THREADS, blocks=(r.blocks_recv, length(r.round.recv)), stream=s)
-        end
-        tr && (t = trace_lap!(TQ_UNPACK, k, t))
+function ImplicitGlobalGrid.fused_halo_start!(A::Tuple{Vararg{CuArray{T,3}}}, dims) where {T}
+    plan = cached_plan(A, dims)
+    plan === nothing && return nothing  # update_halo! next, which waits for this stream
+    start_halo_plan!(plan, A, TRACE[])
+    return HaloUpdate(plan, A)
+end
+ImplicitGlobalGrid.fused_halo_finish!(h::HaloUpdate{<:CuHaloPlan}) = finish_halo_plan!(h.plan, h.A, TRACE[])
+
+# Every round but the receives and the unpack of the last one, which finish_halo_plan! does, then waits for the sends
+function start_halo_plan!(plan::CuHaloPlan, A, tr::Bool)
+    for k in eachindex(plan.rounds)
+        k > 1 && finish_round!(plan, k - 1, A, tr)
+        start_round!(plan, k, A, tr)
     end
+end
+
+function finish_halo_plan!(plan::CuHaloPlan, A, tr::Bool)
+    isempty(plan.rounds) || finish_round!(plan, length(plan.rounds), A, tr)
+    t = tr ? time_ns() : UInt64(0)
     for r in plan.rounds
         MPI.Waitall(r.sendreqs)
     end
     tr && trace_lap!(TQ_WAITALL_SEND, length(plan.rounds), t)
+    return nothing
+end
+
+# Pack round k, wait for the pack and post its messages
+function start_round!(plan::CuHaloPlan, k, A, tr::Bool)
+    r, s, tag = plan.rounds[k], CUDA.stream(), FUSED_TAG + k
+    t = tr ? time_ns() : UInt64(0)
+    if r.blocks_send > 0
+        plan.pack(r.sendbuf, A, r.sendregs, Val(true); threads=HALO_THREADS, blocks=(r.blocks_send, length(r.round.send)), stream=s)
+    end
+    tr && (t = trace_lap!(TQ_PACK, k, t))
+    CUDA.synchronize(s; blocking=true)  # also orders this round's receives after the last unpack from its buffer
+    tr && (t = trace_lap!(TQ_WAIT_PACK, k, t))
+    for (m, msg) in enumerate(r.round.recvmsgs)
+        MPI.Irecv!(r.recvmpi[m], msg.peer, tag, plan.comm, r.recvreqs[m])
+    end
+    tr && (t = trace_lap!(TQ_IRECV, k, t))
+    for (m, msg) in enumerate(r.round.sendmsgs)
+        MPI.Isend(r.sendmpi[m], msg.peer, tag, plan.comm, r.sendreqs[m])
+    end
+    tr && (trace_lap!(TQ_ISEND, k, t); trace_stamp!(TQ_T_FIRST_ISEND, k))
+    return nothing
+end
+
+# Wait for the messages of round k and unpack them on the task's stream, without waiting
+function finish_round!(plan::CuHaloPlan, k, A, tr::Bool)
+    r = plan.rounds[k]
+    t = tr ? time_ns() : UInt64(0)
+    MPI.Waitall(r.recvreqs)
+    tr && (t = trace_lap!(TQ_WAIT_RECV, k, t); trace_stamp!(TQ_T_RECV_DONE, k))
+    if r.blocks_recv > 0
+        plan.unpack(r.recvbuf, A, r.recvregs, Val(false); threads=HALO_THREADS, blocks=(r.blocks_recv, length(r.round.recv)), stream=CUDA.stream())
+    end
+    tr && trace_lap!(TQ_UNPACK, k, t)
     return nothing
 end
