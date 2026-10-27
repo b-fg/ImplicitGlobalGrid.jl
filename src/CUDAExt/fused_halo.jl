@@ -31,12 +31,17 @@ end
 
 const HALO_THREADS = 256
 
+# The field i of a tuple through a chain of branches: indexing the tuple with a runtime index makes the kernel keep
+# the tuple in local memory, which made packing 3 to 5 times slower.
+@inline pick(t::Tuple{Any}, i) = t[1]
+@inline pick(t::Tuple, i) = i == 1 ? t[1] : pick(Base.tail(t), i - 1)
+
 # Copy the regions of the fields to (pack) or from the flat buffer: block row y handles region y.
 function halo_copy!(buf, fields, regions, ::Val{pack}) where {pack}
     reg = @inbounds regions[blockIdx().y]
     n1, n2 = reg.size[1], reg.size[2]
     len = n1 * n2 * reg.size[3]
-    A = fields[reg.field]
+    A = pick(fields, reg.field)
     i = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x - Int32(1)
     stride = gridDim().x * blockDim().x
     while i < len
